@@ -21,6 +21,7 @@
 #include <FirebaseESP32.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <esp_task_wdt.h>
 
 // =============================================================================
 //  FEATURE TOGGLES
@@ -68,11 +69,19 @@ volatile bool g_firebase_ready = false;
 #define LED_LOUD_PIN    21
 #define MOTOR_PIN       47
 
+//INTERRUPT #2
+#define WDT_TIMEOUT_SEC  10   // reboot if logicTask freezes for 10 seconds
+
 // =============================================================================
 //  QR SCANNER PINS
 // =============================================================================
 #define SCANNING_QR_PIN  40
 #define QR_SCANNED_PIN   39
+
+// =============================================================================
+// INTERRUPT #1 - CALIBRATION PIN
+#define RECAL_BUTTON_PIN  14
+volatile bool g_recalibrate_requested = false;
 
 // =============================================================================
 //  AUDIO CONFIG
@@ -117,6 +126,11 @@ QueueHandle_t dbQueue;
 
 volatile float g_noisy_threshold = MANUAL_NOISY_THRESHOLD;
 volatile float g_loud_threshold  = MANUAL_LOUD_THRESHOLD;
+
+// Post-deletion cooldown — prevents re-saving a just-deleted QR code
+volatile unsigned long long g_last_deletion_ms = 0;
+#define QR_POST_DELETE_COOLDOWN_MS  5000   // 5 seconds, adjust to taste
+
 
 ESP32QRCodeReader reader(CAMERA_MODEL_ESP32S3_EYE);
 
@@ -234,11 +248,17 @@ void pushAudioData(float db, float noisy_th, float loud_th, int level) {
 
 // Called from onQrCodeTask on each valid scan
 void pushQRCode(const char *payload) {
-  // FIX #2: bail out if Firebase hasn't been initialized yet
   if (!g_firebase_ready) return;
 
-  String base = "/devices/" DEVICE_ID "/qr_codes";
-  unsigned long long now = getEpochMs();
+  String             base          = "/devices/" DEVICE_ID "/qr_codes";
+  unsigned long long now           = getEpochMs();
+  bool               was_deleted   = false;   // tracks if we just deleted this payload
+
+  // --- Guard: if a deletion just happened, ignore scans during post-delete cooldown
+  if ((now - g_last_deletion_ms) < QR_POST_DELETE_COOLDOWN_MS) {
+    Serial.printf("[QR] Post-deletion cooldown active, skipping scan.\n");
+    return;
+  }
 
   // Step 1: read existing entries
   if (!Firebase.getJSON(fbdo, base)) {
@@ -249,9 +269,9 @@ void pushQRCode(const char *payload) {
     }
   }
 
-  String raw = fbdo.jsonString();
+  String             raw           = fbdo.jsonString();
   StaticJsonDocument<4096> doc;
-  DeserializationError err = deserializeJson(doc, raw);
+  DeserializationError err         = deserializeJson(doc, raw);
 
   String             duplicate_key = "";
   String             oldest_key    = "";
@@ -273,22 +293,30 @@ void pushQRCode(const char *payload) {
       if (strcmp(stored_payload, payload) == 0) {
         unsigned long long age = now - stored_ts;
         if (age < QR_COOLDOWN_MS) {
+          // Within cooldown — ignore entirely
           Serial.printf("[QR] Duplicate within cooldown (%.1f s), skipping.\n",
                         age / 1000.0);
           return;
         } else {
+          // Past cooldown — mark for deletion
           duplicate_key = kv.key().c_str();
         }
       }
     }
   }
 
-  // Step 2: delete expired duplicate
+  // Step 2: delete expired duplicate, then stop — do NOT re-save immediately
   if (duplicate_key.length() > 0) {
     Firebase.deleteNode(fbdo, base + "/" + duplicate_key);
     entry_count--;
-    Serial.printf("[QR] Deleted expired duplicate: %s\n", duplicate_key.c_str());
+    was_deleted          = true;
+    g_last_deletion_ms   = now;   // start post-deletion cooldown
+    Serial.printf("[QR] Deleted expired entry for payload: %s\n"
+                  "     Cooldown active — rescan to save again.\n", payload);
   }
+
+  // Early return — deletion and re-save are now two separate scan events
+  if (was_deleted) return;
 
   // Step 3: evict oldest if at capacity
   if (entry_count >= QR_MAX_ENTRIES && oldest_key.length() > 0) {
@@ -354,9 +382,24 @@ void logicTask(void *pvParameters) {
   unsigned long last_audio_push_ms = 0;
   bool          alert_sent         = false;
 
-  for (;;) {
-    if (xQueueReceive(dbQueue, &received_db, portMAX_DELAY)) {
 
+  esp_task_wdt_add(NULL);
+  for (;;) {
+      // Interrupt #2 — prove logicTask is alive; resets the 10-second watchdog
+      esp_task_wdt_reset();
+
+      // Interrupt #1 — handle recalibration request from button ISR
+      if (g_recalibrate_requested) {
+        g_recalibrate_requested = false;
+        Serial.println("[RECAL] Button pressed — recalibrating...");
+        #if AUTO_CALIBRATE
+          runCalibration();
+        #else
+          Serial.println("[RECAL] AUTO_CALIBRATE is off, nothing to do.");
+        #endif
+      }
+    if (xQueueReceive(dbQueue, &received_db, portMAX_DELAY)) {
+  
       // Classify
       NoiseLevel new_level;
       if      (received_db >= g_loud_threshold)  new_level = LEVEL_LOUD;
@@ -520,6 +563,13 @@ void initI2S() {
 }
 
 // =============================================================================
+//RECALIBRATE BLOCK
+// ISR — keep it minimal, just set a flag
+void IRAM_ATTR onRecalButton() {
+  g_recalibrate_requested = true;
+}
+
+// =============================================================================
 //  AUTO-CALIBRATION BLOCK
 //  -------------------------------------------------------------------------
 //  TO REMOVE: delete from here to the END marker, set AUTO_CALIBRATE 0 above.
@@ -601,6 +651,9 @@ void setup() {
   digitalWrite(SCANNING_QR_PIN, HIGH);
   digitalWrite(QR_SCANNED_PIN,  LOW);
 
+  // Recallibrate button
+  pinMode(RECAL_BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(RECAL_BUTTON_PIN, onRecalButton, FALLING);
   // I2S
   initI2S();
 
@@ -647,6 +700,14 @@ void setup() {
   xTaskCreatePinnedToCore(onQrCodeTask, "QRResult",   16384,  NULL, 4, NULL, 0);
   // Logic/LED: Core 0 priority 1 — FIX #1: 12288 bytes
   xTaskCreatePinnedToCore(logicTask,    "LogicTask",  12288,  NULL, 1, NULL, 0);
+
+  // Interrupt #2 — Watchdog via new struct API (ESP32 Arduino core v3.x)
+  const esp_task_wdt_config_t wdt_config = {
+    .timeout_ms     = 10000,   // 10 seconds
+    .idle_core_mask = 0,       // don't watch idle tasks
+    .trigger_panic  = true     // reboot on timeout instead of just printing
+  };
+  esp_task_wdt_reconfigure(&wdt_config);   // reconfigures the already-running TWDT
 
   // FIX #3: WiFi, NTP, and Firebase are all inside ENABLE_STREAM so they
   // only run (and only need each other) as a single coherent block.
