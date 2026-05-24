@@ -45,7 +45,7 @@ const char *password = "PLDTWIFI_banguis1";
 #define FIREBASE_AUTH  "ataEj3J2JEJGSvQv69DpfvpASrKbGvTDrOUkb3fp"
 #define DEVICE_ID      "unit_A"   // change to "unit_B" on the second device
 
-#define AUDIO_PUSH_INTERVAL_MS   3000
+#define AUDIO_PUSH_INTERVAL_MS   5000
 #define QR_COOLDOWN_MS          10000
 #define QR_MAX_ENTRIES              6
 
@@ -68,6 +68,8 @@ volatile bool g_firebase_ready = false;
 #define LED_NOISY_PIN   46
 #define LED_LOUD_PIN    21
 #define MOTOR_PIN       47
+
+#define WARNING_COUNT_MAX  3 // max warning count for loud noise level
 
 //INTERRUPT #2
 #define WDT_TIMEOUT_SEC  10   // reboot if logicTask freezes for 10 seconds
@@ -130,6 +132,8 @@ volatile float g_loud_threshold  = MANUAL_LOUD_THRESHOLD;
 // Post-deletion cooldown — prevents re-saving a just-deleted QR code
 volatile unsigned long long g_last_deletion_ms = 0;
 #define QR_POST_DELETE_COOLDOWN_MS  5000   // 5 seconds, adjust to taste
+
+volatile int g_warning_count = 0;   // local mirror of DB value
 
 
 ESP32QRCodeReader reader(CAMERA_MODEL_ESP32S3_EYE);
@@ -227,7 +231,38 @@ unsigned long long getEpochMs() {
   return (unsigned long long)(tv.tv_sec)  * 1000ULL
        + (unsigned long long)(tv.tv_usec) / 1000ULL;
 }
+// Fetches warning_count from DB on boot to sync with whatever the dashboard set
+void fetchWarningCount() {
+  if (!g_firebase_ready) return;
+  String path = "/devices/" DEVICE_ID "/warning_count";
+  if (Firebase.getInt(fbdo, path)) {
+    g_warning_count = fbdo.intData();
+    Serial.printf("[Firebase] warning_count synced from DB: %d\n", g_warning_count);
+  } else {
+    // Node doesn't exist yet — write 0 to initialize it
+    Firebase.setInt(fbdo, path, 0);
+    g_warning_count = 0;
+    Serial.println("[Firebase] warning_count initialized to 0 in DB");
+  }
+}
 
+// Increments warning_count in DB and local mirror, capped at WARNING_COUNT_MAX
+void incrementWarningCount() {
+  if (!g_firebase_ready) return;
+  if (g_warning_count >= WARNING_COUNT_MAX) {
+    Serial.printf("[Warning] Count already at max (%d), ignoring.\n",
+                  WARNING_COUNT_MAX);
+    return;
+  }
+  g_warning_count++;
+  String path = "/devices/" DEVICE_ID "/warning_count";
+  if (!Firebase.setInt(fbdo, path, g_warning_count))
+    Serial.printf("[Firebase] warning_count write failed: %s\n",
+                  fbdo.errorReason().c_str());
+  else
+    Serial.printf("[Warning] Count incremented to %d / %d\n",
+                  g_warning_count, WARNING_COUNT_MAX);
+}
 // Called from logicTask every AUDIO_PUSH_INTERVAL_MS
 void pushAudioData(float db, float noisy_th, float loud_th, int level) {
   // FIX #2: bail out if Firebase hasn't been initialized yet
@@ -381,12 +416,27 @@ void logicTask(void *pvParameters) {
   unsigned long last_alert_ms      = 0;
   unsigned long last_audio_push_ms = 0;
   bool          alert_sent         = false;
+  bool          warning_counted    = false; 
 
 
   esp_task_wdt_add(NULL);
   for (;;) {
       // Interrupt #2 — prove logicTask is alive; resets the 10-second watchdog
       esp_task_wdt_reset();
+      // Poll DB for warning_count reset from dashboard (every 5 seconds)
+      static unsigned long last_wcount_check_ms = 0;
+      unsigned long now_wc = millis();
+      if (g_firebase_ready && (now_wc - last_wcount_check_ms) >= 5000) {
+        last_wcount_check_ms = now_wc;
+        String path = "/devices/" DEVICE_ID "/warning_count";
+        if (Firebase.getInt(fbdo, path)) {
+          int db_val = fbdo.intData();
+          if (db_val != g_warning_count) {
+            g_warning_count = db_val;
+            Serial.printf("[Warning] Count synced from DB: %d\n", g_warning_count);
+          }
+        }
+      }
 
       // Interrupt #1 — handle recalibration request from button ISR
       if (g_recalibrate_requested) {
@@ -409,26 +459,41 @@ void logicTask(void *pvParameters) {
       // Transition
       if (new_level != current_level) {
         if (current_level == LEVEL_LOUD && new_level != LEVEL_LOUD) {
-          loud_since = 0;
-          alert_sent = false;
+          loud_since  = 0;
+          alert_sent  = false;
+          warning_counted  = false; 
+        }
+        if (new_level == LEVEL_LOUD && current_level != LEVEL_LOUD) {
+          // Record when we first entered loud — don't act yet
+          loud_since = millis();
         }
         current_level = new_level;
       }
 
-      // Sustained loud alert
+      // Determine what to actually SHOW on LEDs
+      // LEVEL_LOUD is only displayed after SUSTAINED_MS has elapsed.
+      // Before that, treat it visually as LEVEL_NOISY so the red LED
+      // and motor don't fire on brief transient spikes.
+      NoiseLevel display_level = current_level;
       if (current_level == LEVEL_LOUD) {
-        if (loud_since == 0) loud_since = millis();
         unsigned long now = millis();
-        if (!alert_sent
-            && (now - loud_since)    >= SUSTAINED_MS
-            && (now - last_alert_ms) >= ALERT_COOLDOWN_MS) {
-          Serial.println("ALERT: Sustained loud talking detected!");
-          last_alert_ms = now;
-          alert_sent    = true;
+        if ((now - loud_since) < SUSTAINED_MS) {
+          display_level = LEVEL_NOISY;   // not sustained yet — show noisy instead
+        } else {
+          // Sustained threshold crossed — activate LED/motor and count together
+          if (!warning_counted) {
+            incrementWarningCount();     // <-- fires once, same moment LED turns on
+            warning_counted = true;
+          }
+          if (!alert_sent && (now - last_alert_ms) >= ALERT_COOLDOWN_MS) {
+            Serial.println("ALERT: Sustained loud talking detected!");
+            last_alert_ms = now;
+            alert_sent    = true;
+          }
         }
       }
 
-      updateLEDs(current_level);
+      updateLEDs(display_level);   // LEDs and motor follow display_level, not current_level
 
       // Firebase audio push every 3 seconds
       unsigned long now_push = millis();
@@ -733,10 +798,15 @@ void setup() {
     fbConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
     Firebase.begin(&fbConfig, &fbAuth);
     Firebase.reconnectWiFi(true);
+    // FIX: give the SSL layer ~2 seconds to stabilize before first call
+    Serial.print("Waiting for Firebase SSL...");
+    delay(2000);
+    Serial.println(" done");
 
     // FIX #2: only now is it safe for tasks to call pushAudioData/pushQRCode
     g_firebase_ready = true;
     Serial.println("Firebase ready");
+    fetchWarningCount();
   } else {
     Serial.println("Stream + Firebase disabled. QR-only mode.");
   }
